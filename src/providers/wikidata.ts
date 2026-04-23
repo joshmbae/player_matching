@@ -8,6 +8,114 @@ type Binding = Record<string, { value: string } | undefined>;
 export class WikidataProvider implements DataProvider {
   name = "Wikidata";
 
+  async searchPlayers(query: string): Promise<Player[]> {
+    const cacheKey = `playersearch:${query.toLowerCase()}`;
+    const cached = cache.get<Player[]>(cacheKey);
+    if (cached) return cached;
+
+    const escaped = query.replace(/"/g, '\\"');
+    const sparql = `
+SELECT DISTINCT ?player ?playerLabel ?nationalityLabel ?birthDate ?positionLabel WHERE {
+  SERVICE wikibase:mwapi {
+    bd:serviceParam wikibase:endpoint "www.wikidata.org";
+                    wikibase:api "EntitySearch";
+                    mwapi:search "${escaped}";
+                    mwapi:language "en";
+                    mwapi:limit "20".
+    ?player wikibase:apiOutputItem mwapi:item.
+  }
+  ?player wdt:P31 wd:Q5;
+          wdt:P106/wdt:P279* wd:Q937857.
+  OPTIONAL { ?player wdt:P27 ?nationality. }
+  OPTIONAL { ?player wdt:P569 ?birthDate. }
+  OPTIONAL { ?player wdt:P413 ?position. }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "de,en". }
+}
+LIMIT 12`;
+
+    try {
+      const bindings = await sparqlQuery<Binding>(sparql);
+      const players: Player[] = bindings.map((b) => ({
+        id: wikidataId(sparqlValue(b, "player")) ?? sparqlValue(b, "player") ?? "",
+        name: sparqlValue(b, "playerLabel") ?? "",
+        nationality: sparqlValue(b, "nationalityLabel"),
+        birthDate: sparqlValue(b, "birthDate") ? this.formatDate(sparqlValue(b, "birthDate")!) : undefined,
+        birthYear: extractYear(sparqlValue(b, "birthDate")),
+        position: sparqlValue(b, "positionLabel"),
+        wikidataId: wikidataId(sparqlValue(b, "player")),
+        careerEntries: [],
+      })).filter((p) => p.id && p.name);
+
+      cache.set(cacheKey, players);
+      return players;
+    } catch {
+      return [];
+    }
+  }
+
+  async getPlayerCareer(playerId: string): Promise<Player | null> {
+    const cacheKey = `career:${playerId}`;
+    const cached = cache.get<Player>(cacheKey);
+    if (cached) return cached;
+
+    const sparql = `
+SELECT DISTINCT ?playerLabel ?nationalityLabel ?birthDate ?positionLabel ?club ?clubLabel ?startDate ?endDate WHERE {
+  wd:${playerId} p:P54 ?membership.
+  ?membership ps:P54 ?club.
+  OPTIONAL { ?membership pq:P580 ?startDate. }
+  OPTIONAL { ?membership pq:P582 ?endDate. }
+  OPTIONAL { wd:${playerId} wdt:P27 ?nationality. }
+  OPTIONAL { wd:${playerId} wdt:P569 ?birthDate. }
+  OPTIONAL { wd:${playerId} wdt:P413 ?position. }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "de,en". }
+}
+ORDER BY ?startDate`;
+
+    try {
+      const bindings = await sparqlQuery<Binding>(sparql);
+      if (bindings.length === 0) return null;
+
+      const first = bindings[0];
+      const entries: CareerEntry[] = bindings.map((b) => ({
+        clubId: wikidataId(sparqlValue(b, "club")) ?? sparqlValue(b, "club") ?? "",
+        clubName: sparqlValue(b, "clubLabel") ?? sparqlValue(b, "club") ?? "",
+        startDate: sparqlValue(b, "startDate") ? this.formatDate(sparqlValue(b, "startDate")!) : undefined,
+        endDate: sparqlValue(b, "endDate") ? this.formatDate(sparqlValue(b, "endDate")!) : undefined,
+        startYear: extractYear(sparqlValue(b, "startDate")),
+        endYear: extractYear(sparqlValue(b, "endDate")),
+        position: sparqlValue(b, "positionLabel"),
+      })).filter((e) => e.clubId);
+
+      const deduped = this.deduplicateCareerEntries(entries);
+
+      const player: Player = {
+        id: playerId,
+        wikidataId: playerId,
+        name: sparqlValue(first, "playerLabel") ?? playerId,
+        nationality: sparqlValue(first, "nationalityLabel"),
+        birthDate: sparqlValue(first, "birthDate") ? this.formatDate(sparqlValue(first, "birthDate")!) : undefined,
+        birthYear: extractYear(sparqlValue(first, "birthDate")),
+        position: sparqlValue(first, "positionLabel"),
+        careerEntries: deduped,
+      };
+
+      cache.set(cacheKey, player);
+      return player;
+    } catch {
+      return null;
+    }
+  }
+
+  private deduplicateCareerEntries(entries: CareerEntry[]): CareerEntry[] {
+    const seen = new Set<string>();
+    return entries.filter((e) => {
+      const key = `${e.clubId}-${e.startYear ?? ""}-${e.endYear ?? ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   async searchClubs(query: string): Promise<Club[]> {
     const cacheKey = `clubs:${query.toLowerCase()}`;
     const cached = cache.get<Club[]>(cacheKey);
